@@ -10,8 +10,8 @@ from typing import List, Tuple, Set, Optional
 pygame.init()
 
 # Constants
-SCREEN_WIDTH = 1000
-SCREEN_HEIGHT = 700
+SCREEN_WIDTH = 1920
+SCREEN_HEIGHT = 1080
 TILE_SIZE = 20
 GRID_WIDTH = SCREEN_WIDTH // TILE_SIZE
 GRID_HEIGHT = SCREEN_HEIGHT // TILE_SIZE
@@ -594,4 +594,4 @@ class Game:
 
 if __name__ == "__main__":
     game = Game()
-    game.run()
+    game.run()  

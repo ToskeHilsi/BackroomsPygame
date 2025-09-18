@@ -2,6 +2,7 @@ import pygame
 import random
 import math
 import sys
+import time
 from enum import Enum
 from dataclasses import dataclass
 from typing import List, Tuple, Set, Optional
@@ -19,6 +20,12 @@ GRID_HEIGHT = SCREEN_HEIGHT // TILE_SIZE
 # Fade system constants
 FADE_TIME = 300  # Frames until tile completely fades (5 seconds at 60 FPS)
 FADE_RATE = 1.0 / FADE_TIME
+
+# Sprint system constants
+MAX_STAMINA = 100
+STAMINA_DRAIN_RATE = 1.5  # Per frame while sprinting
+STAMINA_REGEN_RATE = 0.8  # Per frame while not sprinting
+SPRINT_MULTIPLIER = 2.0
 
 # Colors
 BLACK = (0, 0, 0)
@@ -41,6 +48,12 @@ LIGHT_GRAY = (192, 192, 192)
 FLUORESCENT_WHITE = (248, 248, 255)
 DIRTY_WHITE = (240, 240, 235)
 BUZZING_YELLOW = (255, 255, 150)
+# Poolrooms colors
+POOL_BLUE = (64, 164, 223)
+POOL_TILE_WHITE = (250, 250, 250)
+POOL_TILE_BLUE = (200, 230, 255)
+POOL_WATER = (100, 200, 255)
+HUMID_YELLOW = (255, 255, 200)
 
 # Game settings
 PLAYER_SPEED = 2
@@ -58,6 +71,9 @@ class TileType(Enum):
     ELECTRICAL = 7
     STAIRWELL = 8
     ELEVATOR = 9
+    LEVEL_EXIT = 10  # Exit to next level
+    POOL = 11  # Pool water
+    POOL_EDGE = 12  # Pool edge tiles
 
 class RoomType(Enum):
     OFFICE_SPACE = "office_space"
@@ -72,6 +88,14 @@ class RoomType(Enum):
     BATHROOM = "bathroom"
     SERVER_ROOM = "server_room"
     ABANDONED_OFFICE = "abandoned_office"
+    # Poolrooms types
+    POOL_AREA = "pool_area"
+    POOL_CORRIDOR = "pool_corridor"
+    POOL_CHANGING = "pool_changing"
+
+class LevelType(Enum):
+    LEVEL_0 = "level_0"  # Classic yellow backrooms
+    POOLROOMS = "poolrooms"  # Level 37 - The Poolrooms
 
 @dataclass
 class Room:
@@ -96,14 +120,190 @@ class Room:
                    self.y + self.height <= other.y or 
                    other.y + other.height <= self.y)
 
+class Entity:
+    """Mysterious entity that appears as another player just out of view"""
+    def __init__(self):
+        self.x = 0
+        self.y = 0
+        self.visible = False
+        self.visibility_timer = 0
+        self.spawn_timer = random.randint(1800, 3600)  # 30-60 seconds at 60 FPS
+        self.angle = 0  # Facing direction
+        self.last_player_x = 0
+        self.last_player_y = 0
+        self.move_timer = 0
+        self.target_angle = 0
+        
+    def update(self, player_x: float, player_y: float, level_type: LevelType, visible_tiles: Set, level_map: List[List[TileType]]):
+        # Only spawn in Level 0, not in Poolrooms
+        if level_type != LevelType.LEVEL_0:
+            self.visible = False
+            return
+            
+        self.spawn_timer -= 1
+        
+        if self.spawn_timer <= 0 and not self.visible:
+            # Try to spawn the entity just outside the visible area but close to player
+            attempts = 0
+            spawned = False
+            
+            while attempts < 20 and not spawned:
+                distance = random.randint(120, 180)  # Close to player
+                angle = random.uniform(0, 2 * math.pi)
+                
+                spawn_x = player_x + math.cos(angle) * distance
+                spawn_y = player_y + math.sin(angle) * distance
+                
+                # Check if spawn position is within map bounds
+                spawn_grid_x = int(spawn_x // TILE_SIZE)
+                spawn_grid_y = int(spawn_y // TILE_SIZE)
+                
+                if (0 <= spawn_grid_x < len(level_map[0]) and 
+                    0 <= spawn_grid_y < len(level_map) and
+                    level_map[spawn_grid_y][spawn_grid_x] == TileType.FLOOR):
+                    
+                    # Check if spawn position would be visible - if so, try different position
+                    if (spawn_grid_x, spawn_grid_y) not in visible_tiles:
+                        self.x = spawn_x
+                        self.y = spawn_y
+                        spawned = True
+                
+                attempts += 1
+            
+            if spawned:
+                # Make entity face a random direction initially
+                self.angle = random.uniform(0, 360)
+                self.target_angle = self.angle
+                
+                self.visible = True
+                self.visibility_timer = random.randint(120, 300)  # 2-5 seconds visible
+                self.spawn_timer = random.randint(1200, 2400)  # Next spawn in 20-40 seconds
+                
+                self.last_player_x = player_x
+                self.last_player_y = player_y
+                self.move_timer = 0
+            else:
+                self.spawn_timer = 60  # Try again in 1 second if couldn't spawn
+            
+        if self.visible:
+            self.visibility_timer -= 1
+            self.move_timer += 1
+            
+            # Entity movement behavior - move around like a player
+            if self.move_timer % 60 == 0:  # Change direction every second
+                self.target_angle = random.uniform(0, 360)
+            
+            # Smoothly rotate towards target angle
+            angle_diff = self.target_angle - self.angle
+            if angle_diff > 180:
+                angle_diff -= 360
+            elif angle_diff < -180:
+                angle_diff += 360
+            
+            self.angle += angle_diff * 0.1  # Smooth rotation
+            
+            # Move forward in facing direction
+            move_speed = 1.0  # Slightly slower than player
+            dx = math.cos(math.radians(self.angle)) * move_speed
+            dy = math.sin(math.radians(self.angle)) * move_speed
+            
+            # Check collision before moving (like player movement)
+            new_x = self.x + dx
+            new_y = self.y + dy
+            
+            if self._can_move_to(new_x, new_y, level_map):
+                self.x = new_x
+                self.y = new_y
+            else:
+                # If can't move forward, pick a new random direction
+                self.target_angle = random.uniform(0, 360)
+            
+            if self.visibility_timer <= 0:
+                self.visible = False
+    
+    def _can_move_to(self, x: float, y: float, level_map: List[List[TileType]]) -> bool:
+        """Check if entity can move to this position (same logic as player)"""
+        entity_size = 8  # Half the entity size
+        
+        positions_to_check = [
+            (x - entity_size, y - entity_size),  # Top-left
+            (x + entity_size, y - entity_size),  # Top-right
+            (x - entity_size, y + entity_size),  # Bottom-left
+            (x + entity_size, y + entity_size),  # Bottom-right
+            (x, y)  # Center
+        ]
+        
+        for check_x, check_y in positions_to_check:
+            grid_x = int(check_x // TILE_SIZE)
+            grid_y = int(check_y // TILE_SIZE)
+            
+            # Check bounds
+            if not (0 <= grid_x < len(level_map[0]) and 0 <= grid_y < len(level_map)):
+                return False
+            
+            # Check for walls and pool edges (but allow walking on pools)
+            tile_type = level_map[grid_y][grid_x]
+            if tile_type == TileType.WALL or tile_type == TileType.POOL_EDGE:
+                return False
+        
+        return True
+    
+    def draw(self, screen, camera_x: float, camera_y: float):
+        if not self.visible:
+            return
+            
+        screen_x = int(self.x - camera_x)
+        screen_y = int(self.y - camera_y)
+        
+        # Only draw if on screen
+        if -50 <= screen_x <= SCREEN_WIDTH + 50 and -50 <= screen_y <= SCREEN_HEIGHT + 50:
+            # Draw as a player-like figure (green rectangle like the real player)
+            player_rect = pygame.Rect(screen_x - 8, screen_y - 8, 16, 16)
+            # Slightly dimmer green to make it feel "off"
+            entity_color = (0, 200, 0)
+            pygame.draw.rect(screen, entity_color, player_rect)
+            
+            # Draw direction indicator (like the real player)
+            end_x = screen_x + math.cos(math.radians(self.angle)) * 20
+            end_y = screen_y + math.sin(math.radians(self.angle)) * 20
+            # Slightly dimmer white
+            pygame.draw.line(screen, (200, 200, 200), 
+                            (screen_x, screen_y), 
+                            (int(end_x), int(end_y)), 2)
+
 class Player:
     def __init__(self, x: float, y: float):
         self.x = x
         self.y = y
         self.angle = 0  # Facing direction in degrees
         self.has_flashlight = True
+        self.stamina = MAX_STAMINA
+        self.is_sprinting = False
+        self.can_sprint = True  # Flag to track if player can start sprinting
         
-    def move(self, dx: float, dy: float, level_map: List[List[TileType]]):
+    def move(self, dx: float, dy: float, level_map: List[List[TileType]], is_sprint_pressed: bool):
+        # Handle sprinting - can only sprint if stamina is full OR already sprinting
+        if self.stamina <= 0:
+            self.can_sprint = False  # Can't sprint until stamina is full again
+        elif self.stamina >= MAX_STAMINA:
+            self.can_sprint = True   # Can sprint again when stamina is full
+        
+        can_sprint = self.can_sprint and is_sprint_pressed and (dx != 0 or dy != 0)
+        
+        if can_sprint:
+            self.is_sprinting = True
+            self.stamina = max(0, self.stamina - STAMINA_DRAIN_RATE)
+            speed_multiplier = SPRINT_MULTIPLIER
+        else:
+            self.is_sprinting = False
+            if self.stamina < MAX_STAMINA:
+                self.stamina = min(MAX_STAMINA, self.stamina + STAMINA_REGEN_RATE)
+            speed_multiplier = 1.0
+        
+        # Apply movement with speed multiplier
+        dx *= speed_multiplier
+        dy *= speed_multiplier
+        
         # Check horizontal movement
         new_x = self.x + dx
         if self._can_move_to(new_x, self.y, level_map):
@@ -134,8 +334,9 @@ class Player:
             if not (0 <= grid_x < len(level_map[0]) and 0 <= grid_y < len(level_map)):
                 return False
             
-            # Check for walls
-            if level_map[grid_y][grid_x] == TileType.WALL:
+            # Check for walls and pool edges (but allow walking on pools)
+            tile_type = level_map[grid_y][grid_x]
+            if tile_type == TileType.WALL or tile_type == TileType.POOL_EDGE:
                 return False
         
         return True
@@ -146,22 +347,42 @@ class Player:
         self.angle = math.degrees(math.atan2(dy, dx))
 
 class BackroomsGenerator:
-    def __init__(self, width: int, height: int):
+    def __init__(self, width: int, height: int, level_type: LevelType = LevelType.LEVEL_0):
         self.width = width
         self.height = height
+        self.level_type = level_type
         self.grid = [[TileType.WALL for _ in range(width)] for _ in range(height)]
         self.rooms = []
         
     def generate(self) -> Tuple[List[List[TileType]], List[Room]]:
+        if self.level_type == LevelType.POOLROOMS:
+            self._generate_poolrooms()
+        else:
+            self._generate_level_0()
+        return self.grid, self.rooms
+    
+    def _generate_level_0(self):
+        """Generate classic Level 0 backrooms"""
         self._generate_rooms()
         self._connect_rooms()
         self._add_room_features()
-        return self.grid, self.rooms
+        self._add_level_exit()
+    
+    def _generate_poolrooms(self):
+        """Generate Level 37 - The Poolrooms"""
+        self._generate_pool_rooms()
+        self._connect_rooms()
+        self._add_pools()
+        self._add_poolrooms_features()
+        self._add_level_exit()
     
     def _generate_rooms(self):
         attempts = 0
         while len(self.rooms) < 20 and attempts < 150:
             room_type = random.choice(list(RoomType))
+            if room_type in [RoomType.POOL_AREA, RoomType.POOL_CORRIDOR, RoomType.POOL_CHANGING]:
+                continue  # Skip poolrooms types in Level 0
+            
             width, height = self._get_room_size(room_type)
             
             x = random.randint(1, self.width - width - 1)
@@ -169,6 +390,27 @@ class BackroomsGenerator:
             
             # Most backrooms areas are dark with flickering lights
             is_lit = random.random() < 0.3  # 30% chance of being lit
+            new_room = Room(x, y, width, height, room_type, is_lit)
+            
+            if not any(new_room.overlaps(existing) for existing in self.rooms):
+                self.rooms.append(new_room)
+                self._carve_room(new_room)
+            
+            attempts += 1
+    
+    def _generate_pool_rooms(self):
+        """Generate rooms specific to the poolrooms"""
+        pool_room_types = [RoomType.POOL_AREA, RoomType.POOL_CORRIDOR, RoomType.POOL_CHANGING]
+        attempts = 0
+        while len(self.rooms) < 15 and attempts < 150:
+            room_type = random.choice(pool_room_types)
+            width, height = self._get_room_size(room_type)
+            
+            x = random.randint(1, self.width - width - 1)
+            y = random.randint(1, self.height - height - 1)
+            
+            # Poolrooms are better lit than Level 0
+            is_lit = random.random() < 0.7  # 70% chance of being lit
             new_room = Room(x, y, width, height, room_type, is_lit)
             
             if not any(new_room.overlaps(existing) for existing in self.rooms):
@@ -190,7 +432,11 @@ class BackroomsGenerator:
             RoomType.CAFETERIA: (12, 18, 8, 14),
             RoomType.BATHROOM: (4, 8, 6, 10),
             RoomType.SERVER_ROOM: (6, 10, 6, 10),
-            RoomType.ABANDONED_OFFICE: (6, 12, 6, 12)
+            RoomType.ABANDONED_OFFICE: (6, 12, 6, 12),
+            # Poolrooms sizes
+            RoomType.POOL_AREA: (15, 25, 10, 20),
+            RoomType.POOL_CORRIDOR: (25, 45, 4, 8),
+            RoomType.POOL_CHANGING: (8, 12, 6, 10)
         }
         
         min_w, max_w, min_h, max_h = size_ranges.get(room_type, (6, 12, 6, 12))
@@ -294,35 +540,154 @@ class BackroomsGenerator:
                 if self.grid[y][x] == TileType.FLOOR:
                     self.grid[y][x] = TileType.VENT
 
+    def _add_pools(self):
+        """Add pools to poolrooms"""
+        for room in self.rooms:
+            if room.room_type == RoomType.POOL_AREA:
+                # Add a pool in the center of the room, but smaller to avoid blocking exits
+                pool_width = max(3, min(room.width - 6, room.width // 2))  # Smaller pool
+                pool_height = max(3, min(room.height - 6, room.height // 2))  # Smaller pool
+                start_x = room.x + (room.width - pool_width) // 2
+                start_y = room.y + (room.height - pool_height) // 2
+                
+                # Create pool edges (only if there's space and won't block pathways)
+                for y in range(start_y - 1, start_y + pool_height + 1):
+                    for x in range(start_x - 1, start_x + pool_width + 1):
+                        if (room.x + 2 <= x <= room.x + room.width - 3 and 
+                            room.y + 2 <= y <= room.y + room.height - 3):  # Keep edges away from room borders
+                            if (x == start_x - 1 or x == start_x + pool_width or 
+                                y == start_y - 1 or y == start_y + pool_height):
+                                # Only place pool edge if it won't block critical paths
+                                if not ((x <= room.x + 2 or x >= room.x + room.width - 3) or
+                                       (y <= room.y + 2 or y >= room.y + room.height - 3)):
+                                    self.grid[y][x] = TileType.POOL_EDGE
+                
+                # Fill pool with water (smaller area)
+                for y in range(start_y, start_y + pool_height):
+                    for x in range(start_x, start_x + pool_width):
+                        if (room.x + 2 < x < room.x + room.width - 3 and 
+                            room.y + 2 < y < room.y + room.height - 3):
+                            self.grid[y][x] = TileType.POOL
+    
+    def _add_poolrooms_features(self):
+        """Add features specific to poolrooms"""
+        for room in self.rooms:
+            if room.room_type == RoomType.POOL_CHANGING:
+                # Add some benches/lockers
+                for _ in range(random.randint(1, 2)):
+                    x = random.randint(room.x + 1, room.x + room.width - 2)
+                    y = random.randint(room.y + 1, room.y + room.height - 2)
+                    if self.grid[y][x] == TileType.FLOOR:
+                        self.grid[y][x] = TileType.EXIT  # Repurpose as furniture
+    
+    def _add_level_exit(self):
+        """Add an exit to the next level"""
+        if not self.rooms:
+            return
+        
+        # Place exit in a random room, preferably a larger one
+        suitable_rooms = [room for room in self.rooms if room.width * room.height >= 64]
+        if not suitable_rooms:
+            suitable_rooms = self.rooms
+        
+        exit_room = random.choice(suitable_rooms)
+        
+        # Place exit in a corner of the room
+        corner_positions = [
+            (exit_room.x + 1, exit_room.y + 1),  # Top-left
+            (exit_room.x + exit_room.width - 2, exit_room.y + 1),  # Top-right
+            (exit_room.x + 1, exit_room.y + exit_room.height - 2),  # Bottom-left
+            (exit_room.x + exit_room.width - 2, exit_room.y + exit_room.height - 2)  # Bottom-right
+        ]
+        
+        for x, y in corner_positions:
+            if 0 <= x < self.width and 0 <= y < self.height and self.grid[y][x] == TileType.FLOOR:
+                self.grid[y][x] = TileType.LEVEL_EXIT
+                break
+
 class Game:
     def __init__(self):
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-        pygame.display.set_caption("The Backrooms - Level 0")
         self.clock = pygame.time.Clock()
+        
+        # Game state
+        self.current_level = LevelType.LEVEL_0
+        self.game_won = False
         
         # Camera offset
         self.camera_x = 0
         self.camera_y = 0
         
-        # Generate backrooms layout (make it larger for better exploration)
-        generator = BackroomsGenerator(GRID_WIDTH * 3, GRID_HEIGHT * 3)
-        self.level_map, self.rooms = generator.generate()
+        # Initialize first level
+        self._init_level()
         
-        # Find a starting position in the first room
-        start_room = self.rooms[0] if self.rooms else None
-        if start_room:
-            self.player = Player(
-                start_room.center()[0] * TILE_SIZE,
-                start_room.center()[1] * TILE_SIZE
-            )
-        else:
-            self.player = Player(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+        # Mysterious entity
+        self.entity = Entity()
+        
+        # Ping system
+        self.ping_active = False
+        self.ping_radius = 0
+        self.ping_max_radius = 300
+        self.ping_speed = 8
+        self.exit_positions = []  # Store positions of level exits
         
         # Visibility system
         self.visible_tiles = set()
         self.explored_tiles = {}  # Now stores fade timers
         
+    def _init_level(self):
+        """Initialize the current level"""
+        pygame.display.set_caption(f"The Backrooms - {self.current_level.value.replace('_', ' ').title()}")
+        
+        # Generate level layout
+        generator = BackroomsGenerator(GRID_WIDTH * 3, GRID_HEIGHT * 3, self.current_level)
+        self.level_map, self.rooms = generator.generate()
+        
+        # Find a starting position in the first room
+        start_room = self.rooms[0] if self.rooms else None
+        if start_room:
+            if hasattr(self, 'player'):
+                # Keep existing player, just move position
+                self.player.x = start_room.center()[0] * TILE_SIZE
+                self.player.y = start_room.center()[1] * TILE_SIZE
+            else:
+                self.player = Player(
+                    start_room.center()[0] * TILE_SIZE,
+                    start_room.center()[1] * TILE_SIZE
+                )
+        else:
+            if hasattr(self, 'player'):
+                self.player.x = SCREEN_WIDTH // 2
+                self.player.y = SCREEN_HEIGHT // 2
+            else:
+                self.player = Player(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)
+        
+        # Reset visibility
+        self.visible_tiles = set()
+        self.explored_tiles = {}
+        
+        # Reset entity
+        self.entity = Entity()
+        
+        # Find and store exit positions for ping system
+        self.exit_positions = []
+        for y in range(len(self.level_map)):
+            for x in range(len(self.level_map[0])):
+                if self.level_map[y][x] == TileType.LEVEL_EXIT:
+                    self.exit_positions.append((x * TILE_SIZE, y * TILE_SIZE))
+        
+    def _transition_to_next_level(self):
+        """Handle transition to next level"""
+        if self.current_level == LevelType.LEVEL_0:
+            self.current_level = LevelType.POOLROOMS
+            self._init_level()
+        elif self.current_level == LevelType.POOLROOMS:
+            self.game_won = True
+    
     def update(self):
+        if self.game_won:
+            return
+            
         keys = pygame.key.get_pressed()
         dx = dy = 0
         
@@ -335,7 +700,24 @@ class Game:
         if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
             dx = PLAYER_SPEED
         
-        self.player.move(dx, dy, self.level_map)
+        # Check for sprint (Space key)
+        is_sprint_pressed = keys[pygame.K_SPACE]
+        
+        # Check for ping (P key)
+        if keys[pygame.K_p] and not self.ping_active:
+            self.ping_active = True
+            self.ping_radius = 0
+        
+        self.player.move(dx, dy, self.level_map, is_sprint_pressed)
+        
+        # Check for level exit collision
+        player_grid_x = int(self.player.x // TILE_SIZE)
+        player_grid_y = int(self.player.y // TILE_SIZE)
+        
+        if (0 <= player_grid_x < len(self.level_map[0]) and 
+            0 <= player_grid_y < len(self.level_map) and
+            self.level_map[player_grid_y][player_grid_x] == TileType.LEVEL_EXIT):
+            self._transition_to_next_level()
         
         # Update camera to center on player
         self._update_camera()
@@ -347,6 +729,16 @@ class Game:
         self.player.update_angle((world_mouse_x, world_mouse_y))
         
         self._update_visibility()
+        
+        # Update ping system
+        if self.ping_active:
+            self.ping_radius += self.ping_speed
+            if self.ping_radius >= self.ping_max_radius:
+                self.ping_active = False
+                self.ping_radius = 0
+        
+        # Update mysterious entity (pass visible_tiles to avoid spawning in visible areas)
+        self.entity.update(self.player.x, self.player.y, self.current_level, self.visible_tiles, self.level_map)
     
     def _update_camera(self):
         # Center camera on player
@@ -446,6 +838,12 @@ class Game:
             distance += 0.1
     
     def _get_tile_color(self, tile_type: TileType, room_type: RoomType = None) -> Tuple[int, int, int]:
+        if self.current_level == LevelType.POOLROOMS:
+            return self._get_poolrooms_tile_color(tile_type, room_type)
+        else:
+            return self._get_level_0_tile_color(tile_type, room_type)
+    
+    def _get_level_0_tile_color(self, tile_type: TileType, room_type: RoomType = None) -> Tuple[int, int, int]:
         base_colors = {
             TileType.WALL: CREAM,  # Yellowy backrooms walls
             TileType.FLOOR: DARK_YELLOW,  # Moist carpet
@@ -455,6 +853,7 @@ class Game:
             TileType.ELECTRICAL: ORANGE,  # Electrical hazards
             TileType.STAIRWELL: LIGHT_GRAY,
             TileType.ELEVATOR: GRAY,
+            TileType.LEVEL_EXIT: PURPLE,  # Level exit portal
         }
         
         # Modify colors based on room type for that authentic backrooms feel
@@ -478,8 +877,27 @@ class Game:
         
         return base_colors.get(tile_type, BUZZING_YELLOW)
     
+    def _get_poolrooms_tile_color(self, tile_type: TileType, room_type: RoomType = None) -> Tuple[int, int, int]:
+        base_colors = {
+            TileType.WALL: POOL_TILE_WHITE,  # White tiled walls
+            TileType.FLOOR: POOL_TILE_BLUE,  # Light blue tiles
+            TileType.EXIT: GREEN,  # Emergency exits
+            TileType.VENT: DARK_GRAY,  # Air vents
+            TileType.WATER_DAMAGE: BLUE,  # Water stains
+            TileType.ELECTRICAL: ORANGE,  # Electrical hazards
+            TileType.LEVEL_EXIT: PURPLE,  # Level exit portal
+            TileType.POOL: POOL_WATER,  # Pool water
+            TileType.POOL_EDGE: POOL_BLUE,  # Pool edges
+        }
+        
+        return base_colors.get(tile_type, HUMID_YELLOW)
+    
     def draw(self):
         self.screen.fill(BLACK)
+        
+        if self.game_won:
+            self._draw_victory_screen()
+            return
         
         # Calculate which tiles are visible on screen
         start_x = max(0, int(self.camera_x // TILE_SIZE) - 1)
@@ -522,6 +940,20 @@ class Game:
                 # Draw tile borders for visible tiles
                 if is_visible and tile_type != TileType.WALL:
                     pygame.draw.rect(self.screen, GRAY, tile_rect, 1)
+                
+                # Special effects for level exit
+                if is_visible and tile_type == TileType.LEVEL_EXIT:
+                    # Pulsing effect
+                    pulse = abs(math.sin(time.time() * 3)) * 50
+                    pulse_color = tuple(min(255, int(c + pulse)) for c in color)
+                    pygame.draw.rect(self.screen, pulse_color, tile_rect)
+        
+        # Draw mysterious entity
+        self.entity.draw(self.screen, self.camera_x, self.camera_y)
+        
+        # Draw ping effect
+        if self.ping_active:
+            self._draw_ping()
         
         # Draw player (convert world coordinates to screen coordinates)
         player_screen_x = int(self.player.x - self.camera_x)
@@ -545,7 +977,71 @@ class Game:
         
         pygame.display.flip()
     
+    def _draw_victory_screen(self):
+        """Draw the victory screen"""
+        font_large = pygame.font.Font(None, 72)
+        font_medium = pygame.font.Font(None, 48)
+        font_small = pygame.font.Font(None, 36)
+        
+        # Victory text
+        victory_text = font_large.render("YOU ESCAPED THE BACKROOMS!", True, GREEN)
+        victory_rect = victory_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 100))
+        self.screen.blit(victory_text, victory_rect)
+        
+        # Congratulations text
+        congrats_text = font_medium.render("Congratulations on finding your way out!", True, WHITE)
+        congrats_rect = congrats_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 20))
+        self.screen.blit(congrats_text, congrats_rect)
+        
+        # Instructions to restart
+        restart_text = font_small.render("Press ESC to quit or R to restart", True, FLUORESCENT_WHITE)
+        restart_rect = restart_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 + 60))
+        self.screen.blit(restart_text, restart_rect)
+    
+    def _draw_ping(self):
+        """Draw the circular ping effect emanating from exits"""
+        if not self.exit_positions:
+            return
+            
+        for exit_x, exit_y in self.exit_positions:
+            # Convert exit world coordinates to screen coordinates
+            screen_exit_x = int(exit_x + TILE_SIZE // 2 - self.camera_x)
+            screen_exit_y = int(exit_y + TILE_SIZE // 2 - self.camera_y)
+            
+            # Only draw if the center is reasonably close to screen
+            if (-500 <= screen_exit_x <= SCREEN_WIDTH + 500 and 
+                -500 <= screen_exit_y <= SCREEN_HEIGHT + 500):
+                
+                # Draw multiple concentric circles for the ping effect
+                for i in range(3):
+                    radius_offset = i * 25
+                    current_radius = max(0, self.ping_radius - radius_offset)
+                    
+                    if current_radius > 5:  # Only draw if radius is meaningful
+                        # Calculate alpha based on ping progress (fade out as it expands)
+                        alpha = max(0, 255 - int((current_radius / self.ping_max_radius) * 255))
+                        alpha = max(0, alpha - i * 50)  # Each ring is dimmer
+                        
+                        if alpha > 20:  # Only draw if visible enough
+                            # Draw the ring directly without surface (simpler approach)
+                            ring_color = (128, 0, 128)  # Purple color
+                            
+                            # Draw multiple thin circles to create a thick ring effect
+                            for thickness in range(4):
+                                radius = max(1, int(current_radius) - thickness)
+                                if radius > 0:
+                                    try:
+                                        pygame.draw.circle(self.screen, ring_color, 
+                                                         (screen_exit_x, screen_exit_y), radius, 1)
+                                    except:
+                                        pass  # Skip if drawing fails
+    
     def _draw_ui(self):
+        # Current level info
+        level_name = self.current_level.value.replace('_', ' ').title()
+        if self.current_level == LevelType.POOLROOMS:
+            level_name = "Level 37 - The Poolrooms"
+        
         # Current room info
         current_room = self._get_current_room()
         if current_room:
@@ -556,24 +1052,68 @@ class Game:
             lighting_text = "Dim/Broken Lights"
         
         font = pygame.font.Font(None, 36)
+        level_surface = font.render(f"Level: {level_name}", True, FLUORESCENT_WHITE)
         room_surface = font.render(room_text, True, FLUORESCENT_WHITE)
         lighting_surface = font.render(f"Lighting: {lighting_text}", True, FLUORESCENT_WHITE)
         
-        self.screen.blit(room_surface, (10, 10))
-        self.screen.blit(lighting_surface, (10, 50))
+        self.screen.blit(level_surface, (10, 10))
+        self.screen.blit(room_surface, (10, 50))
+        self.screen.blit(lighting_surface, (10, 90))
         
-        # Backrooms-themed instructions
-        instructions = [
-            "WASD/Arrow Keys: Move carefully",
-            "Mouse: Aim flashlight",
-            "Find the way out...",
-            "The humming grows louder..."
-        ]
+        # Stamina bar
+        stamina_width = 200
+        stamina_height = 20
+        stamina_x = SCREEN_WIDTH - stamina_width - 20
+        stamina_y = 20
+        
+        # Background
+        stamina_bg = pygame.Rect(stamina_x, stamina_y, stamina_width, stamina_height)
+        pygame.draw.rect(self.screen, DARK_GRAY, stamina_bg)
+        
+        # Stamina fill
+        stamina_fill_width = int((self.player.stamina / MAX_STAMINA) * stamina_width)
+        if stamina_fill_width > 0:
+            stamina_fill = pygame.Rect(stamina_x, stamina_y, stamina_fill_width, stamina_height)
+            stamina_color = GREEN if self.player.stamina > 30 else YELLOW if self.player.stamina > 10 else RED
+            pygame.draw.rect(self.screen, stamina_color, stamina_fill)
+        
+        # Stamina border
+        pygame.draw.rect(self.screen, WHITE, stamina_bg, 2)
+        
+        # Stamina label
+        small_font = pygame.font.Font(None, 24)
+        stamina_label = small_font.render(f"Stamina: {int(self.player.stamina)}", True, WHITE)
+        self.screen.blit(stamina_label, (stamina_x, stamina_y - 25))
+        
+        # Sprint indicator
+        if self.player.is_sprinting:
+            sprint_text = small_font.render("SPRINTING", True, YELLOW)
+            self.screen.blit(sprint_text, (stamina_x, stamina_y + stamina_height + 5))
+        
+        # Instructions based on current level
+        if self.current_level == LevelType.LEVEL_0:
+            instructions = [
+                "WASD/Arrow Keys: Move carefully",
+                "SPACE (hold): Sprint (drains stamina)",
+                "P: Ping exits (purple circles)",
+                "Mouse: Aim flashlight",
+                "Find the purple exit to reach the Poolrooms...",
+                "Was that another person in the shadows?"
+            ]
+        else:  # Poolrooms
+            instructions = [
+                "WASD/Arrow Keys: Move carefully",
+                "SPACE (hold): Sprint (drains stamina)", 
+                "P: Ping exits (purple circles)",
+                "Mouse: Aim flashlight",
+                "Find the purple exit to escape!",
+                "The humid air makes you feel uneasy..."
+            ]
         
         small_font = pygame.font.Font(None, 24)
         for i, instruction in enumerate(instructions):
             text_surface = small_font.render(instruction, True, BUZZING_YELLOW)
-            self.screen.blit(text_surface, (10, SCREEN_HEIGHT - 110 + i * 25))
+            self.screen.blit(text_surface, (10, SCREEN_HEIGHT - 140 + i * 25))
     
     def run(self):
         running = True
@@ -584,6 +1124,11 @@ class Game:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_ESCAPE:
                         running = False
+                    elif event.key == pygame.K_r and self.game_won:
+                        # Restart the game
+                        self.current_level = LevelType.LEVEL_0
+                        self.game_won = False
+                        self._init_level()
             
             self.update()
             self.draw()
@@ -594,4 +1139,5 @@ class Game:
 
 if __name__ == "__main__":
     game = Game()
-    game.run()  
+    game.run()
+        
